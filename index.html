@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Send files</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f3f5f9;color:#1b2233}
+.wrap{max-width:520px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:8px 0 4px}
+p.sub{margin:0 0 14px;color:#5b6577;font-size:15px}
+.conn{display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:10px 12px;border-radius:10px;background:#fff7e0;color:#7a5b00;font-size:14px}
+.conn.ok{background:#e5f6ec;color:#16774a}.conn.bad{background:#fdeaea;color:#a02222}
+.conn i{width:10px;height:10px;border-radius:50%;background:currentColor;flex:none}
+.pick{display:block;width:100%;padding:22px 12px;border:2px dashed #3b6cf6;border-radius:14px;background:#fff;color:#3b6cf6;font-size:18px;font-weight:600;text-align:center}
+.pick small{display:block;font-weight:400;color:#6b7690;font-size:13px;margin-top:6px}
+input[type=file]{display:none}
+ul{list-style:none;margin:16px 0 0;padding:0}
+li{background:#fff;border-radius:12px;padding:12px 14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(20,30,60,.08)}
+.nm{font-size:15px;word-break:break-all}
+.st{font-size:13px;color:#6b7690;margin-top:4px}
+.bar{height:6px;background:#e4e8f1;border-radius:3px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:#3b6cf6;transition:width .15s}
+li.ok .bar i{background:#1fa463}li.ok .st{color:#1fa463}
+li.err .bar i{background:#d33;width:100%}li.err .st{color:#d33}
+button.send{margin-top:16px;width:100%;padding:16px;border:0;border-radius:12px;background:#3b6cf6;color:#fff;font-size:18px;font-weight:600}
+button.send[disabled]{background:#aab6d6}
+.done{display:none;margin-top:16px;padding:14px;border-radius:12px;background:#e5f6ec;color:#16774a;font-weight:600;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Send your files</h1>
+  <p class="sub">Choose your Aadhaar, PDF or photo files. They go directly to the counter computer.</p>
+  <div id="conn" class="conn"><i></i><span id="connTxt">Connecting to the counter computer...</span></div>
+  <label class="pick" for="f">+ Choose files<small>PDF, JPG, PNG &mdash; you can select more than one</small></label>
+  <input id="f" type="file" multiple accept="application/pdf,image/*,.pdf">
+  <ul id="list"></ul>
+  <button id="send" class="send" disabled>Send</button>
+  <div id="done" class="done"></div>
+</div>
+<script src="vendor/peerjs.min.js"></script>
+<script src="config.js"></script>
+<script>
+(function(){
+  var pcId = location.hash.replace('#','');
+  var cfg = window.QRCFG;
+  var input = document.getElementById('f'), list = document.getElementById('list');
+  var btn = document.getElementById('send'), done = document.getElementById('done');
+  var conn = document.getElementById('conn'), connTxt = document.getElementById('connTxt');
+  var items = [], busy = false, link = null, ready = false, peer = null, tries = 0, waiters = {};
+  var PIECE = 16384, SLICE = 262144;
+
+  function fmt(n){ return n > 1048576 ? (n/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(n/1024))+' KB'; }
+  function setConn(cls, txt){ conn.className = 'conn ' + cls; connTxt.textContent = txt; }
+  function refresh(){
+    var pending = 0;
+    for (var i = 0; i < items.length; i++) if (!items[i].sent) pending++;
+    btn.disabled = busy || pending === 0 || !ready;
+    btn.textContent = busy ? 'Sending...' : (pending ? 'Send '+pending+' file'+(pending>1?'s':'') : 'Send');
+  }
+
+  /* ---------- connection ---------- */
+  function connect(){
+    if (!/^qrps[0-9a-f]{16}$/.test(pcId)) { setConn('bad', 'This QR code is not valid. Scan the QR on the counter computer.'); return; }
+    if (!window.Peer || !window.RTCPeerConnection) { setConn('bad', 'This browser cannot send directly. Open this page in Chrome.'); return; }
+    tries++;
+    setConn('', 'Connecting to the counter computer...');
+    if (peer) { try { peer.destroy(); } catch (e) {} }
+    peer = new Peer({ host: cfg.peer.host, port: cfg.peer.port, path: cfg.peer.path, secure: cfg.peer.secure, key: cfg.peer.key,
+                      config: { iceServers: cfg.ice || [] }, debug: 0 });
+    var timer = setTimeout(function(){ fail('Could not connect. Check that the counter computer program is open and shows this QR. Your mobile network may also block direct connections - try Wi-Fi.'); }, 25000);
+    function fail(msg){ clearTimeout(timer); ready = false; setConn('bad', msg); refresh(); }
+    peer.on('error', function(e){
+      var t = e && e.type;
+      if (t === 'peer-unavailable') fail('Counter computer not found. The QR may have expired - scan the new QR.');
+      else fail('Connection problem (' + (t || 'unknown') + '). Reload this page to retry.');
+    });
+    peer.on('open', function(){
+      link = peer.connect(pcId, { reliable: true, serialization: 'raw' });
+      link.on('open', function(){ clearTimeout(timer); ready = true; setConn('ok', 'Connected to the counter computer'); refresh(); });
+      link.on('data', function(d){
+        if (typeof d !== 'string') return;
+        var m; try { m = JSON.parse(d); } catch (e) { return; }
+        if (m.t === 'ack' && waiters[m.id]) { var w = waiters[m.id]; delete waiters[m.id]; w(!!m.ok); }
+      });
+      link.on('close', function(){ ready = false; setConn('bad', 'Disconnected from the counter computer. Reload this page.'); refresh(); });
+      link.on('error', function(){ fail('Connection lost. Reload this page.'); });
+    });
+  }
+
+  /* ---------- sending ---------- */
+  function readSlice(file, a, b){
+    var blob = file.slice(a, b);
+    if (blob.arrayBuffer) return blob.arrayBuffer();
+    return new Promise(function(res, rej){ var fr = new FileReader(); fr.onload = function(){ res(fr.result); }; fr.onerror = rej; fr.readAsArrayBuffer(blob); });
+  }
+  function drain(){
+    return new Promise(function(res){
+      (function chk(){
+        var dc = link && link.dataChannel;
+        if (!dc || dc.readyState !== 'open') return res();
+        if (dc.bufferedAmount > 1048576) setTimeout(chk, 25); else res();
+      })();
+    });
+  }
+  function sendFile(it, onProgress){
+    var file = it.file, id = Math.random().toString(16).slice(2, 12), off = 0;
+    var ack = new Promise(function(res){ waiters[id] = res; });
+    link.send(JSON.stringify({ t: 'meta', id: id, name: file.name, size: file.size }));
+    function step(){
+      if (off >= file.size) { link.send(JSON.stringify({ t: 'end', id: id })); return ack; }
+      return readSlice(file, off, Math.min(file.size, off + SLICE)).then(function(buf){
+        var p = 0;
+        function pieces(){
+          if (p >= buf.byteLength) return Promise.resolve();
+          return drain().then(function(){
+            if (!ready) throw new Error('lost');
+            link.send(buf.slice(p, p + PIECE)); p += PIECE;
+            return pieces();
+          });
+        }
+        return pieces().then(function(){ off += buf.byteLength; onProgress(Math.round(off * 100 / Math.max(1, file.size))); return step(); });
+      });
+    }
+    return step();
+  }
+
+  input.onchange = function(){
+    for (var i = 0; i < input.files.length; i++) {
+      var file = input.files[i];
+      var li = document.createElement('li');
+      li.innerHTML = '<div class="nm"></div><div class="st">Ready &middot; '+fmt(file.size)+'</div><div class="bar"><i></i></div>';
+      li.firstChild.textContent = file.name;
+      list.appendChild(li);
+      items.push({file:file, li:li, sent:false});
+    }
+    input.value = ''; done.style.display = 'none'; refresh();
+  };
+
+  btn.onclick = function(){
+    if (busy || !ready) return;
+    busy = true; refresh();
+    var queue = items.filter(function(x){ return !x.sent; }), n = 0, ok = 0;
+    (function next(){
+      if (n >= queue.length) {
+        busy = false; refresh();
+        if (ok) { done.style.display = 'block'; done.textContent = ok + ' file' + (ok>1?'s':'') + ' sent. You can close this page.'; }
+        return;
+      }
+      var it = queue[n++], st = it.li.children[1], bar = it.li.children[2].firstChild;
+      it.li.className = '';
+      sendFile(it, function(p){ bar.style.width = p + '%'; st.textContent = 'Sending ' + p + '%'; }).then(function(good){
+        if (good) { it.sent = true; ok++; it.li.className = 'ok'; bar.style.width = '100%'; st.textContent = 'Sent ✓'; }
+        else { it.li.className = 'err'; st.textContent = 'Failed - tap Send to retry'; }
+        next();
+      }, function(){ it.li.className = 'err'; st.textContent = 'Connection lost - reload the page'; busy = false; refresh(); });
+    })();
+  };
+
+  connect();
+})();
+</script>
+</body>
+</html>
